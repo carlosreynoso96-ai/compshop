@@ -1,13 +1,51 @@
 """
 Stage 1: Scan folder, qualify PDFs by property keyword in filename.
 Stage 2: Extract text from qualifying PDFs using pypdf.
+Stage 2b: Automatic OCR fallback for scanned / image-only pages.
 """
 
+import io
+import logging
 import re
 from pathlib import Path
 from dataclasses import dataclass, field
 
 import pypdf
+
+log = logging.getLogger(__name__)
+
+# ── OCR constants ───────────────────────────────────────────
+OCR_CHAR_THRESHOLD = 50  # pages with fewer chars are considered scanned
+OCR_DPI = 300  # render resolution for OCR
+
+
+def _ocr_available() -> bool:
+    """Return True if pymupdf + pytesseract + Tesseract binary are all usable."""
+    try:
+        import fitz  # noqa: F401  (PyMuPDF)
+        import pytesseract
+
+        # Quick sanity check — will raise if tesseract binary missing
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
+
+def _ocr_page_image(pdf_path: Path, page_index: int) -> str:
+    """Render *one* PDF page to an image and run Tesseract OCR on it."""
+    import fitz
+    import pytesseract
+    from PIL import Image
+
+    doc = fitz.open(str(pdf_path))
+    page = doc[page_index]
+    mat = fitz.Matrix(OCR_DPI / 72, OCR_DPI / 72)
+    pix = page.get_pixmap(matrix=mat)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    text = pytesseract.image_to_string(img)
+    doc.close()
+    return text.strip()
 
 
 @dataclass
@@ -17,6 +55,7 @@ class PDFDocument:
     segment_code: str
     pages: list[dict] = field(default_factory=list)
     total_chars: int = 0
+    ocr_applied: bool = False
 
 
 def extract_segment_code(filename):
@@ -49,19 +88,44 @@ def scan_and_qualify(input_dir, property_keyword, latest_only=False):
     return qualifying
 
 
-def extract_text(pdf_paths):
+def extract_text(pdf_paths, *, enable_ocr: bool = True):
     """
     Stage 2: Extract text from each qualifying PDF.
+    If *enable_ocr* is True and a page yields < OCR_CHAR_THRESHOLD chars,
+    the page is rendered to an image and run through Tesseract OCR.
     Returns list of PDFDocument objects with text and metadata.
     """
+    ocr_ok = enable_ocr and _ocr_available()
+    if enable_ocr and not ocr_ok:
+        log.warning(
+            "OCR requested but pymupdf/pytesseract/Tesseract not available — skipping OCR"
+        )
+
     documents = []
     for pdf_path in pdf_paths:
         reader = pypdf.PdfReader(str(pdf_path))
         pages = []
         total = 0
+        used_ocr = False
+
         for i, page in enumerate(reader.pages):
             text = page.extract_text() or ""
-            pages.append({"page": i + 1, "text": text})
+            source = "text"
+
+            # ── OCR fallback for scanned / image-only pages ─────
+            if ocr_ok and len(text.strip()) < OCR_CHAR_THRESHOLD:
+                try:
+                    ocr_text = _ocr_page_image(pdf_path, i)
+                    if len(ocr_text) > len(text):
+                        text = ocr_text
+                        source = "ocr"
+                        used_ocr = True
+                except Exception as exc:
+                    log.warning(
+                        "OCR failed on %s page %d: %s", pdf_path.name, i + 1, exc
+                    )
+
+            pages.append({"page": i + 1, "text": text, "source": source})
             total += len(text)
 
         doc = PDFDocument(
@@ -70,6 +134,7 @@ def extract_text(pdf_paths):
             segment_code=extract_segment_code(pdf_path.name),
             pages=pages,
             total_chars=total,
+            ocr_applied=used_ocr,
         )
         documents.append(doc)
 

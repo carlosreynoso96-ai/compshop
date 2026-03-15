@@ -7,7 +7,7 @@ Extracts and normalizes gaming-related competitor offers from casino promotional
 ### 1. Install (one command)
 
 ```
-pip install git+https://github.com/YOURACCOUNT/compshop.git
+pip install git+https://github.com/carlosreynoso96-ai/compshop.git
 ```
 
 ### 2. Set your API key
@@ -50,6 +50,7 @@ compshop --property "MGM Detroit" --input ./pdfs/ --template ./CompShopAgentTemp
 | `--property-keyword` | No | auto | Keyword to match in PDF filenames |
 | `--dry-run` | No | — | Scan PDFs without making API calls |
 | `--latest-only` | No | — | Process only the newest qualifying PDF |
+| `--no-ocr` | No | — | Disable automatic OCR for scanned PDFs |
 
 ## Examples
 
@@ -85,7 +86,7 @@ Creates `MasterCompShopData_YYYY-MM.xlsx` in the output directory with all extra
 ## Updating
 
 ```
-pip install --upgrade git+https://github.com/YOURACCOUNT/compshop.git
+pip install --upgrade git+https://github.com/carlosreynoso96-ai/compshop.git
 ```
 
 ## Cost
@@ -100,3 +101,4 @@ Costs scale linearly with PDF count.
 
 - Python 3.10+
 - Anthropic API key
+- **Tesseract OCR** (for scanned/image-only PDFs) — [Download installer](https://github.com/UB-Mannheim/tesseract/wiki). Install to default `C:\Program Files\Tesseract-OCR`. Compshop auto-detects it.

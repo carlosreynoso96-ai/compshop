@@ -6,6 +6,7 @@ Returns parsed JSON offer arrays with usage stats.
 
 import json
 import os
+import re
 import time
 
 import httpx
@@ -25,6 +26,84 @@ class ClassificationResult:
         self.total_calls = 0
         self.total_time = 0.0
         self.errors = []
+        self.warnings = []
+
+
+def _repair_json(text: str) -> list[dict]:
+    """
+    Best-effort JSON repair for Claude responses.
+    Handles: trailing commas, truncated arrays, unquoted keys, etc.
+    Returns a list of offer dicts (may be empty on total failure).
+    """
+    original = text
+
+    # 1. Strip markdown fences
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+    if text.startswith("json"):
+        text = text[4:].strip()
+
+    # 2. Try direct parse first
+    try:
+        result = json.loads(text)
+        if isinstance(result, list):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Remove trailing commas before ] or }
+    cleaned = re.sub(r",\s*([}\]])", r"\1", text)
+    try:
+        result = json.loads(cleaned)
+        if isinstance(result, list):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # 4. Handle truncated response — close any open braces/brackets
+    truncated = cleaned.rstrip()
+    open_braces = truncated.count("{") - truncated.count("}")
+    open_brackets = truncated.count("[") - truncated.count("]")
+    if open_braces > 0 or open_brackets > 0:
+        # Try to close at last complete object boundary
+        # Find the last complete "}" and truncate there
+        last_brace = truncated.rfind("}")
+        if last_brace > 0:
+            candidate = truncated[:last_brace + 1]
+            # Close any remaining open brackets
+            remaining_brackets = candidate.count("[") - candidate.count("]")
+            candidate += "]" * remaining_brackets
+            try:
+                result = json.loads(candidate)
+                if isinstance(result, list):
+                    return result
+            except json.JSONDecodeError:
+                pass
+
+    # 5. Last resort: extract individual JSON objects with regex
+    objects = []
+    depth = 0
+    start = None
+    for i, ch in enumerate(original):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    obj = json.loads(original[start:i + 1])
+                    if isinstance(obj, dict) and "Property" in obj:
+                        objects.append(obj)
+                except json.JSONDecodeError:
+                    pass
+                start = None
+    return objects
 
 
 def get_api_key():
@@ -91,23 +170,10 @@ def call_claude(model, system_prompt, user_message, api_key, use_cache=False):
         if block.get("type") == "text":
             text += block["text"]
 
-    # Parse JSON response
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-    if text.startswith("json"):
-        text = text[4:].strip()
-
-    try:
-        offers = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise APIError(f"Failed to parse JSON response: {e}\nRaw (first 500): {text[:500]}")
-
-    if not isinstance(offers, list):
-        raise APIError(f"Expected JSON array, got {type(offers).__name__}")
+    # Parse JSON response with robust repair
+    offers = _repair_json(text)
+    if not offers:
+        raise APIError(f"Failed to extract any offers from response.\nRaw (first 500): {text.strip()[:500]}")
 
     return offers, usage, elapsed
 
@@ -137,7 +203,15 @@ def classify_batches(batches, model_id, system_prompt, api_key, progress_callbac
                 progress_callback(i, len(batches), offers, usage, elapsed)
 
         except APIError as e:
-            result.errors.append(f"Batch {i + 1}: {e}")
+            error_msg = str(e)
+            result.errors.append(f"Batch {i + 1}: {error_msg}")
+
+            # Even on error, try to salvage offers from partial response
+            if "Raw (first 500):" in error_msg:
+                raw_start = error_msg.index("Raw (first 500):") + len("Raw (first 500):")
+                # Already attempted in _repair_json, nothing more to do
+                pass
+
             if progress_callback:
                 progress_callback(i, len(batches), [], {}, 0)
 
